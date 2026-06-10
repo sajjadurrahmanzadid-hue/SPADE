@@ -253,10 +253,14 @@ def anova_table(param):
     f_v   = ms_t/ms_e if ms_e and ms_e>0 else np.nan
     p_v   = 1-stats.f.cdf(f_v, df_t, df_e) if not np.isnan(f_v) else np.nan
     cv    = np.sqrt(ms_e)/gm*100 if gm!=0 and not np.isnan(ms_e) else np.nan
+    # Harmonic mean of group sizes — the correct n for a single LSD when
+    # replication is unequal (e.g. a pot excluded after hail damage).
+    sizes  = [len(g) for g in valid]
+    n_harm = len(sizes) / sum(1.0/s for s in sizes) if all(s > 0 for s in sizes) else np.nan
     return dict(ss_t=ss_t, ss_e=ss_e, ss_total=ss_t+ss_e,
                 df_t=df_t, df_e=df_e, df_total=N-1,
                 ms_t=ms_t, ms_e=ms_e, f=f_v, p=p_v,
-                cv=cv, N=N, k=k, gm=gm)
+                cv=cv, N=N, k=k, gm=gm, n_harm=n_harm)
 
 def run_tukey(param):
     sub = st.session_state.df[["Treatment",param]].dropna()
@@ -269,9 +273,17 @@ def run_tukey(param):
     except:
         return None
 
-def lsd_05(an, r=3):
+def lsd_05(an, r=None):
+    """Fisher's LSD at α=0.05. Uses the harmonic mean of group sizes when
+    replication is unequal (falls back to 3 only if unavailable). Note: LSD is
+    NOT multiplicity-corrected — the Tukey CLD governs the letter groupings;
+    LSD is reported for reference only (Piepho 2018)."""
     if not an or np.isnan(an["ms_e"]):
         return np.nan
+    if r is None:
+        r = an.get("n_harm", 3)
+        if r is None or (isinstance(r, float) and np.isnan(r)):
+            r = 3
     return stats.t.ppf(0.975, an["df_e"]) * np.sqrt(2*an["ms_e"]/r)
 
 def sig_label(p):
@@ -333,11 +345,14 @@ def compact_letter_display(tukey_res, means_dict):
 
 # ── OUTLIER TESTS ─────────────────────────────────────────────────────────────
 # Dixon's Q critical values (two-tailed, α=0.05) for n=3–10
+# Dixon's Q (r10) critical values — two-sided 95% (α=0.05), Rorabacher (1991), n=3–10
 DIXON_Q_CRIT = {3:0.970,4:0.829,5:0.710,6:0.625,7:0.568,8:0.526,9:0.493,10:0.466}
 
 def dixon_q_test(vals):
     """
-    Dixon's Q test — ideal for n=3–10.
+    Dixon's Q test (the r10 ratio) for n=3–10.
+    Critical values are the two-sided 95% (α=0.05) table of Rorabacher (1991);
+    the r10 statistic is used across the whole n=3–10 range, matching that table.
     Returns list of dicts for any detected outliers (low or high end).
     """
     vals = [v for v in vals if not np.isnan(v)]
@@ -576,6 +591,138 @@ def effect_sizes(an):
         "eta2_interp":   interp(eta2),
         "omega2_interp": interp(omega2),
     }
+
+def _es_interp(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
+    if v < 0.01:  return "negligible"
+    if v < 0.06:  return "small"
+    if v < 0.14:  return "medium"
+    return "large"
+
+def effect_sizes_twoway(table, model=None):
+    """
+    Partial effect sizes for each term in a two-way ANOVA table.
+      partial η²  = SS_effect / (SS_effect + SS_error)
+      partial ω²  = df·(F − 1) / (df·(F − 1) + N_total)   (Olejnik & Algina 2003)
+    Robust to either Type II or Type III tables and to a dropped interaction.
+    """
+    if table is None or "Error" not in table.index:
+        return None
+    ss_err = float(table.loc["Error", "sum_sq"])
+    df_err = float(table.loc["Error", "df"])
+    ms_err = ss_err / df_err if df_err > 0 else np.nan
+    # Total sample size: prefer the fitted model's nobs (robust to Type II/III
+    # table shape, which differ in whether an Intercept row is present).
+    if model is not None and hasattr(model, "nobs"):
+        N_total = int(model.nobs)
+    else:
+        N_total = int(table["df"].sum())   # fallback (Type II tables only)
+    out = {}
+    for src in table.index:
+        if src in ("Error", "Intercept"):
+            continue
+        ss = float(table.loc[src, "sum_sq"])
+        df = float(table.loc[src, "df"])
+        F  = table.loc[src, "F"] if "F" in table.columns else np.nan
+        p_eta2 = ss / (ss + ss_err) if (ss + ss_err) > 0 else np.nan
+        if not np.isnan(F) and df > 0:
+            num = df * (F - 1)
+            p_omega2 = max(0.0, num / (num + N_total))
+        else:
+            p_omega2 = np.nan
+        out[src] = {"p_eta2": round(float(p_eta2), 4),
+                    "p_omega2": round(float(p_omega2), 4),
+                    "interp": _es_interp(p_omega2)}
+    return out
+
+# ── PLANNED CONTRASTS ─────────────────────────────────────────────────────────
+def planned_contrasts(param):
+    """
+    A-priori contrasts that answer the experiment's primary questions directly,
+    using the pooled error (MS_error, df_error) from the one-way ANOVA. Pooled-
+    error contrasts have more power than a full Tukey sweep and test specific
+    hypotheses rather than all 28 pairwise comparisons.
+
+    Contrasts (matched N rate, so foliar TYPE is isolated):
+      • Nano vs Granular @ 50% RDN   : T7 − T8   (the headline nano-vs-gran test)
+      • Nano vs Water    @ 50% RDN   : T7 − T6
+      • Nano vs Water    @ 75% RDN   : T4 − T5
+      • Nano vs Water    @ 100% RDN  : T3 − T2
+      • Any foliar N     vs control  : (mean of T2–T8 means) − T1
+    Each row: estimate, SE = sqrt(MSE·(1/n_i + 1/n_j)), t, two-sided p (df_error),
+    and Holm-adjusted p across the contrast family.
+    """
+    an = anova_table(param)
+    if an is None or np.isnan(an["ms_e"]):
+        return None
+    mse, df_e = an["ms_e"], an["df_e"]
+    m, _, _ = means_se_sd(param)
+    mean_by = {T_IDS[i]: m[i] for i in range(len(T_IDS))}
+    n_by = {t: int(st.session_state.df[st.session_state.df["Treatment"]==t][param].dropna().shape[0])
+            for t in T_IDS}
+
+    def pair(a, b, label):
+        ma, mb = mean_by.get(a, np.nan), mean_by.get(b, np.nan)
+        na, nb = n_by.get(a, 0), n_by.get(b, 0)
+        if np.isnan(ma) or np.isnan(mb) or na < 1 or nb < 1:
+            return None
+        est = ma - mb
+        se  = np.sqrt(mse * (1.0/na + 1.0/nb))
+        if se == 0:
+            return None
+        t   = est / se
+        p   = 2 * (1 - stats.t.cdf(abs(t), df_e))
+        return {"Contrast": label, "Estimate": est, "SE": se, "t": t, "p_raw": p}
+
+    specs = [
+        ("T7", "T8", "Nano vs Granular @ 50% RDN"),
+        ("T7", "T6", "Nano vs Water @ 50% RDN"),
+        ("T4", "T5", "Nano vs Water @ 75% RDN"),
+        ("T3", "T2", "Nano vs Water @ 100% RDN"),
+    ]
+    rows = [r for r in (pair(a, b, lab) for a, b, lab in specs) if r is not None]
+
+    # Fertilised (any foliar) vs absolute control
+    fert = [t for t in ["T2","T3","T4","T5","T6","T7","T8"]
+            if not np.isnan(mean_by.get(t, np.nan)) and n_by.get(t,0) >= 1]
+    if not np.isnan(mean_by.get("T1", np.nan)) and n_by.get("T1",0) >= 1 and fert:
+        mean_fert = np.mean([mean_by[t] for t in fert])
+        # variance of a mean-of-means contrast vs a single group
+        coef_sq = sum((1.0/len(fert))**2 / n_by[t] for t in fert) + 1.0 / n_by["T1"]
+        se = np.sqrt(mse * coef_sq)
+        if se > 0:
+            est = mean_fert - mean_by["T1"]
+            t = est / se
+            rows.append({"Contrast": "Fertilised (T2–T8) vs Control (T1)",
+                         "Estimate": est, "SE": se, "t": t,
+                         "p_raw": 2 * (1 - stats.t.cdf(abs(t), df_e))})
+
+    if not rows:
+        return None
+
+    # Holm step-down adjustment across the family
+    order = sorted(range(len(rows)), key=lambda i: rows[i]["p_raw"])
+    mtot  = len(rows)
+    prev  = 0.0
+    for rank, i in enumerate(order):
+        adj = min(1.0, (mtot - rank) * rows[i]["p_raw"])
+        adj = max(adj, prev)   # enforce monotonicity
+        rows[i]["p_holm"] = adj
+        prev = adj
+
+    dec = P_DEC.get(param, 2)
+    out = []
+    for r in rows:
+        out.append({
+            "Contrast":        r["Contrast"],
+            "Estimate":        round(r["Estimate"], dec),
+            "SE":              round(r["SE"], dec),
+            "t":               round(r["t"], 3),
+            "p (raw)":         round(r["p_raw"], 4),
+            "p (Holm)":        round(r["p_holm"], 4),
+            "Significant":     "Yes *" if r["p_holm"] < 0.05 else "No",
+        })
+    return pd.DataFrame(out)
 
 # ── BIOLOGICAL YIELD + HARVEST INDEX ─────────────────────────────────────────
 def compute_bio_yield():
@@ -914,7 +1061,29 @@ def data_completeness():
     return out, overall, filled_cells, total_cells
 
 def nue_dataframe():
+    """
+    NUE indices on a CONSISTENT per-pot basis.
+
+    All tissue quantities (grain/straw yield, N uptake) are entered/derived in
+    g per pot. Applied N (`t["n"]`) is a field rate in kg N/ha. Mixing g/pot
+    quantities with a kg/ha rate makes RE-N (a recovery fraction) and the
+    PFP-N/AE-N productivity ratios dimensionally incoherent. We therefore convert
+    applied N to g N per pot using the same pot-area conversion already used in
+    compute_n_balance(), so numerator and denominator share one basis:
+
+        N applied (g/pot) = rate (kg/ha) × pot_area (m²) / 10000 × 1000
+
+    PFP-N and AE-N are then g grain per g N (= kg/kg, basis-invariant);
+    RE-N is a true % recovery; PE-N (g grain gain / g N-uptake gain) and
+    NHI (% of plant N in grain) do not involve applied N and were already
+    basis-consistent.
+    """
     d  = st.session_state.df
+    pot_area = st.session_state.get("pot_area", 0.04)   # m²
+
+    def n_app_gpot(rate_kgha):
+        return rate_kgha * pot_area / 10000 * 1000      # g N / pot
+
     t1 = d[d["Treatment"]=="T1"]
     t1_gy = t1["grainY"].mean(); t1_sy = t1["strawY"].mean()
     t1_gN = t1["grainN"].mean(); t1_sN = t1["strawN"].mean()
@@ -929,25 +1098,32 @@ def nue_dataframe():
         nu   = (gy*gN/100 + sy*sN/100
                 if not any(np.isnan([gy,sy,gN,sN])) else np.nan)
         gNu  = gy*gN/100 if not any(np.isnan([gy,gN])) else np.nan
-        nA   = t["n"]
+        nA_gp = n_app_gpot(t["n"]) if t["n"] > 0 else 0.0   # g N/pot
 
         def v(x, dec=2): return round(float(x),dec) if not np.isnan(x) else "—"
 
-        pfp = v(gy/nA)                       if nA>0 and not np.isnan(gy)                         else "—"
-        ae  = v((gy-t1_gy)/nA)               if nA>0 and not any(np.isnan([gy,t1_gy]))            else "—"
-        re  = v((nu-t1_nu)/nA*100, 1)        if nA>0 and not any(np.isnan([nu,t1_nu]))            else "—"
+        # PFP-N, AE-N: per-pot yield (g) ÷ per-pot N (g) = g grain / g N (= kg/kg)
+        pfp = v(gy/nA_gp)              if nA_gp>0 and not np.isnan(gy)              else "—"
+        ae  = v((gy-t1_gy)/nA_gp)     if nA_gp>0 and not any(np.isnan([gy,t1_gy])) else "—"
+        # RE-N: true recovery % — both terms now g N/pot
+        re  = v((nu-t1_nu)/nA_gp*100, 1) if nA_gp>0 and not any(np.isnan([nu,t1_nu])) else "—"
+        # PE-N: only interpretable when the treatment took up MORE N than control.
         dnu = nu-t1_nu if not any(np.isnan([nu,t1_nu])) else np.nan
-        pe  = v((gy-t1_gy)/dnu)              if (nA>0 and not np.isnan(dnu) and dnu!=0
-                                                 and not any(np.isnan([gy,t1_gy])))               else "—"
-        nhi = v(gNu/nu*100, 1)               if (not np.isnan(gNu) and not np.isnan(nu) and nu>0) else "—"
-        pro = v(gN*5.7)                       if not np.isnan(gN)                                  else "—"
+        if (nA_gp>0 and not np.isnan(dnu) and dnu > 1e-9
+                and not any(np.isnan([gy,t1_gy]))):
+            pe = v((gy-t1_gy)/dnu)
+        else:
+            # dnu ≤ 0 → uptake not increased over control; ratio is not meaningful
+            pe = "—"
+        nhi = v(gNu/nu*100, 1)        if (not np.isnan(gNu) and not np.isnan(nu) and nu>0) else "—"
+        pro = v(gN*5.7)               if not np.isnan(gN)                                  else "—"
 
         rows.append({
             "Treatment":        t["id"],
             "Description":      t["desc"],
-            "N Applied (kg/ha)": nA if nA>0 else "—",
-            "PFP-N (g/kg)":     pfp,
-            "AE-N (g/kg)":      ae,
+            "N Applied (g/pot)": round(nA_gp, 4) if nA_gp>0 else "—",
+            "PFP-N (g/g)":      pfp,
+            "AE-N (g/g)":       ae,
             "RE-N (%)":         re,
             "PE-N (g/g)":       pe,
             "NHI (%)":          nhi,
@@ -960,8 +1136,20 @@ def nue_dataframe():
 # ── 2-WAY ANOVA ────────────────────────────────────────────────────────────────
 def two_way_anova(param, mode="balanced"):
     """
-    mode='balanced' : T2-T7 only, 3×2 factorial (N rate × Foliar)
-    mode='full'     : all 8 treatments, unbalanced Type III SS
+    mode='balanced' : T2-T7 only — complete, balanced 3×2 factorial
+                      (N rate {N1,N2,N3} × Foliar {Water,Nano}).
+    mode='full'     : all 8 treatments. The full treatment set does NOT form a
+                      complete factorial (e.g. Gran appears only at N1; Control
+                      only at N0), so several N_rate × Foliar cells have zero
+                      observations. With empty cells the interaction term is not
+                      estimable and Type III main effects that condition on it are
+                      not interpretable. In that case we DROP the interaction and
+                      fit an additive main-effects model with Type II SS, which is
+                      the appropriate choice for unbalanced data without a tested
+                      interaction (Langsrud 2003).
+
+    Returns (table, info). info carries: model, means_a, means_b, cell_means,
+    sub, ss_type ('III' or 'II'), design_complete (bool), note (str).
     """
     d = st.session_state.df.copy()
     d["N_rate"] = d["Treatment"].map(FACTOR_N)
@@ -978,9 +1166,35 @@ def two_way_anova(param, mode="balanced"):
     sub["N_rate"] = sub["N_rate"].astype("category")
     sub["Foliar"]  = sub["Foliar"].astype("category")
 
+    # ── Detect empty factorial cells ─────────────────────────────────────────
+    cell_counts = sub.groupby(["N_rate", "Foliar"], observed=True)["Y"].count()
+    n_levels_a  = sub["N_rate"].nunique()
+    n_levels_b  = sub["Foliar"].nunique()
+    n_filled    = (cell_counts > 0).sum()
+    design_complete = (n_filled == n_levels_a * n_levels_b)
+
     try:
-        model = ols("Y ~ C(N_rate) + C(Foliar) + C(N_rate):C(Foliar)", data=sub).fit()
-        table = anova_lm(model, typ=3)
+        if design_complete:
+            # Complete factorial → test interaction with Type III SS
+            model = ols("Y ~ C(N_rate) + C(Foliar) + C(N_rate):C(Foliar)",
+                        data=sub).fit()
+            table = anova_lm(model, typ=3)
+            ss_type = "III"
+            note = ("Complete factorial: interaction tested with Type III SS."
+                    if mode == "balanced" else
+                    "All factorial cells filled: interaction tested with Type III SS.")
+        else:
+            # Incomplete design → interaction not estimable. Additive model, Type II.
+            model = ols("Y ~ C(N_rate) + C(Foliar)", data=sub).fit()
+            table = anova_lm(model, typ=2)
+            ss_type = "II"
+            empty = n_levels_a * n_levels_b - n_filled
+            note = (f"Design is not a complete factorial ({empty} empty cell(s)): "
+                    "the N rate × Foliar interaction is not estimable, so it has "
+                    "been dropped. Main effects are reported with Type II SS "
+                    "(Langsrud 2003). Treat this as exploratory — for a clean "
+                    "factorial use Balanced mode, and for the nano-vs-granular "
+                    "comparison use the planned contrasts in the ANOVA tab.")
 
         # Clean up index names
         idx_map = {}
@@ -1000,9 +1214,9 @@ def two_way_anova(param, mode="balanced"):
         table.index = [idx_map.get(i, i) for i in table.index]
 
         # Factor level means
-        means_a = sub.groupby("N_rate")["Y"].agg(["mean","sem","count"]).reset_index()
-        means_b = sub.groupby("Foliar")["Y"].agg(["mean","sem","count"]).reset_index()
-        cell_means = sub.groupby(["N_rate","Foliar"])["Y"].agg(["mean","sem","count"]).reset_index()
+        means_a = sub.groupby("N_rate", observed=True)["Y"].agg(["mean","sem","count"]).reset_index()
+        means_b = sub.groupby("Foliar", observed=True)["Y"].agg(["mean","sem","count"]).reset_index()
+        cell_means = sub.groupby(["N_rate","Foliar"], observed=True)["Y"].agg(["mean","sem","count"]).reset_index()
 
         return table, {
             "model": model,
@@ -1010,6 +1224,9 @@ def two_way_anova(param, mode="balanced"):
             "means_b": means_b,
             "cell_means": cell_means,
             "sub": sub,
+            "ss_type": ss_type,
+            "design_complete": bool(design_complete),
+            "note": note,
         }
     except Exception as e:
         return None, str(e)
@@ -1579,7 +1796,10 @@ def generate_docx_report():
     doc.add_heading("3. Parameter Results  (Mean ± SD, n=3)", 1)
     italic_para(doc,
         "Statistical significance: * p<0.05  ** p<0.01  *** p<0.001  ns p≥0.05. "
-        "Effect size: ω² negligible <0.01, small 0.01–0.06, medium 0.06–0.14, large ≥0.14."
+        "Effect size: ω² negligible <0.01, small 0.01–0.06, medium 0.06–0.14, large ≥0.14. "
+        "Note: p-values are per-parameter and are not corrected for testing many "
+        "parameters; when screening across all parameters, treat marginal results "
+        "(0.01 < p < 0.05) as exploratory or apply a false-discovery-rate adjustment."
     )
 
     for grp_name, params in PARAM_GROUPS.items():
@@ -1621,9 +1841,13 @@ def generate_docx_report():
     # ── NUE indices ────────────────────────────────────────────────────────────
     doc.add_heading("4. NUE Indices", 1)
     italic_para(doc,
-        "PFP-N: g grain / kg N applied.  AE-N: g yield gain / kg N.  "
-        "RE-N: % N recovery in biomass.  PE-N: g yield gain / g N uptake.  "
-        "NHI: % grain N / total plant N.  Protein: grain N% × 5.7."
+        "All indices on a per-pot basis. N applied converted from kg/ha to g/pot "
+        "via pot area, so applied N and N uptake share one basis. "
+        "PFP-N: g grain per g N applied (= kg/kg).  AE-N: g grain gain per g N applied.  "
+        "RE-N: % of applied N recovered in above-ground biomass.  "
+        "PE-N: g grain gain per g N-uptake gain (reported only when uptake exceeds the control).  "
+        "NHI: % of plant N partitioned to grain.  Protein: grain N% × 5.7. "
+        "Uptake uses oven-dry tissue mass."
     )
     nue_df = nue_dataframe()
     add_tbl(doc, list(nue_df.columns),
@@ -2212,6 +2436,12 @@ with tab_stats:
             "ω²":      [f"{es['omega2']:.4f}" if es else "—", "", ""],
         })
         st.dataframe(anova_df, hide_index=True, use_container_width=True)
+        st.caption(
+            "LSD (0.05) is **uncorrected** for multiple comparisons and is shown for "
+            "reference only; the compact letter display below is governed by the "
+            "multiplicity-controlled **Tukey HSD** (Piepho 2018). LSD uses the harmonic "
+            "mean of group sizes when replication is unequal."
+        )
         table_jpg_btn(
             anova_df,
             f"One-Way ANOVA — {P_LABEL.get(param, param)}  |  F({an['df_t']},{an['df_e']})={an['f']:.3f}  p={an['p']:.4f} {sl}  LSD(0.05)={lsd:.4f}  CV={an['cv']:.1f}%",
@@ -2306,6 +2536,31 @@ with tab_stats:
                              columns=tk.summary().data[0]),
                              hide_index=True, use_container_width=True)
 
+        # ── Planned contrasts (a-priori) ──
+        st.divider()
+        st.markdown("#### Planned Contrasts (a-priori, pooled error)")
+        st.caption(
+            "These test the experiment's specific questions directly — isolating "
+            "foliar **type** at a matched N rate — using the pooled MS_error from the "
+            "ANOVA above. More powerful and more targeted than the full Tukey sweep, "
+            "and the cleanest way to compare nano vs granular urea (T7 vs T8 @ 50% RDN). "
+            "p-values are Holm-adjusted across this contrast family."
+        )
+        pc_df = planned_contrasts(param)
+        if pc_df is not None:
+            st.dataframe(
+                pc_df.style.apply(
+                    lambda col: ["color:#c0392b;font-weight:bold" if v=="Yes *"
+                                 else "color:#999" for v in col]
+                    if col.name=="Significant" else [""]*len(col), axis=0),
+                hide_index=True, use_container_width=True,
+            )
+            table_jpg_btn(pc_df,
+                          f"Planned Contrasts — {P_LABEL.get(param, param)} (pooled error, Holm-adjusted)",
+                          f"Contrasts_{param}.jpg")
+        else:
+            st.info("Planned contrasts need replicate data for the relevant treatments "
+                    "(e.g. T7 and T8 for the nano-vs-granular comparison).")
 
         st.divider()
         st.markdown("#### Residual Q-Q Plot — Normality Check")
@@ -2377,8 +2632,14 @@ with tab_twoway:
 
 | Factor | Levels | Treatments |
 |---|---|---|
-| **A — N Rate** | N0 (0%), N1 (50%), N2 (75%), N3 (100%) | T1, T6-T8, T4-T5, T2-T3 |
-| **B — Foliar type** | Control, Water, Nano, Gran | T1, T2/T5/T6, T3/T4/T7, T8 |
+| **A — N Rate** | N1 (50%), N2 (75%), N3 (100%) | T6/T7, T4/T5, T2/T3 |
+| **B — Foliar type** | Water, Nano | T2/T5/T6, T3/T4/T7 |
+
+*The clean factorial (Balanced mode) spans N1–N3 × {Water, Nano}. The absolute
+control (T1, N0) and the granulated-urea treatment (T8, Gran at N1) sit outside
+this grid: including them (Full mode) makes the design non-factorial with empty
+cells, so the interaction cannot be estimated — see the note below the table.
+The nano-vs-granular question is answered by the planned contrasts in the ANOVA tab.*
     """)
 
     st.divider()
@@ -2389,10 +2650,13 @@ with tab_twoway:
     with c_m:
         tw_mode = st.radio(
             "Dataset:",
-            ["Balanced (T2–T7 only)", "Full — all 8 (Type III SS)"],
+            ["Balanced (T2–T7 only)", "Full — all 8 (exploratory)"],
             help=(
-                "Balanced uses T2–T7: perfect 3×2 factorial (N Rate × Foliar Water/Nano).\n"
-                "Full includes T1 (control) and T8 (Gran) with unbalanced Type III SS."
+                "Balanced uses T2–T7: a complete, equally-replicated 3×2 factorial "
+                "(N rate × Foliar Water/Nano). Interaction tested with Type III SS.\n"
+                "Full adds T1 (control) and T8 (Gran). This is NOT a complete "
+                "factorial — empty cells make the interaction non-estimable, so SPADE "
+                "drops it and reports main effects with Type II SS (exploratory only)."
             ),
         )
     mode_key = "balanced" if "Balanced" in tw_mode else "full"
@@ -2410,9 +2674,17 @@ with tab_twoway:
             )
     else:
         dec = P_DEC.get(tw_param, 2)
+        ss_type = tw_info.get("ss_type", "III")
+        note    = tw_info.get("note", "")
+
+        # Surface the design status prominently
+        if not tw_info.get("design_complete", True):
+            st.warning(note, icon="⚠️")
+        else:
+            st.caption(note)
 
         # ── ANOVA table ──
-        st.markdown("#### Two-Way ANOVA Table (Type III SS)")
+        st.markdown(f"#### Two-Way ANOVA Table (Type {ss_type} SS)")
         tw_disp = tw_table.copy()
         tw_disp = tw_disp[~tw_disp.index.str.contains("Intercept", na=False)]
 
@@ -2434,9 +2706,24 @@ with tab_twoway:
         st.dataframe(tw_anova_df, hide_index=True, use_container_width=True)
         table_jpg_btn(
             tw_anova_df,
-            f"Two-Way ANOVA (Type III SS) — {P_LABEL.get(tw_param, tw_param)}  |  {'Balanced (T2–T7)' if mode_key=='balanced' else 'Full — all 8 treatments'}",
+            f"Two-Way ANOVA (Type {ss_type} SS) — {P_LABEL.get(tw_param, tw_param)}  |  {'Balanced (T2–T7)' if mode_key=='balanced' else 'Full — all 8 (exploratory)'}",
             f"ANOVA_2way_{tw_param}.jpg",
         )
+
+        # ── Partial effect sizes per factor ──
+        es_tw = effect_sizes_twoway(tw_table, tw_info.get("model"))
+        if es_tw:
+            st.caption(
+                "**Partial effect sizes** (partial η² = SS_effect / (SS_effect + SS_error); "
+                "partial ω² from F and df, Olejnik & Algina 2003). "
+                "Thresholds: small 0.01, medium 0.06, large 0.14."
+            )
+            es_rows = [{"Source": k,
+                        "partial η²": f"{v['p_eta2']:.4f}",
+                        "partial ω²": f"{v['p_omega2']:.4f}",
+                        "Magnitude":  v["interp"].title()}
+                       for k, v in es_tw.items()]
+            st.dataframe(pd.DataFrame(es_rows), hide_index=True, use_container_width=True)
 
         # Quick significance summary
         def get_p(src_fragment):
@@ -2530,11 +2817,16 @@ interpret main effects cautiously and focus on cell means and the interaction pl
 
 **Significance codes:** *** p<0.001 · ** p<0.01 · * p<0.05 · ns p≥0.05
 
-**Balanced mode** (recommended): Uses T2–T7, a perfect 3×2 factorial with equal replication.
-Standard ANOVA assumptions fully met.
+**Balanced mode** (recommended): Uses T2–T7, a complete 3×2 factorial (N rate ×
+{Water, Nano}) with equal replication. The interaction is estimable and is tested
+with Type III SS; standard factorial assumptions hold.
 
-**Full mode**: Includes T1 (control, 0% N, no foliar) and T8 (Gran at 50% RDN). Unbalanced
-design — Type III SS correctly partitions variance but interpretations are more nuanced.
+**Full mode** (exploratory): Adds T1 (control, 0% N) and T8 (Gran at 50% RDN). These
+do not complete the factorial grid — several N rate × foliar cells are empty — so the
+interaction is **not estimable**. SPADE therefore drops the interaction and reports
+main effects only, with Type II SS (Langsrud 2003). Use this descriptively. The
+nano-vs-granular comparison is answered cleanly by the **planned contrasts** in the
+ANOVA tab (T7 vs T8 at matched 50% RDN), not by this model.
 """)
 
 
@@ -2545,16 +2837,23 @@ with tab_nue:
     sync_df_from_editors()
     with st.expander("Formula reference", expanded=False):
         st.markdown("""
+All indices are computed on a **consistent per-pot basis**. Applied N is converted
+from the field rate (kg N/ha) to **g N/pot** using pot area, so applied N and plant
+N uptake are expressed in the same units — this is required for RE-N to be a true
+recovery fraction.
+
 | Index | Formula | Unit | Requires |
 |---|---|---|---|
-| PFP-N | Grain yield ÷ N applied | g/kg | Grain yield + N rate |
-| AE-N  | (Yt − YT1) ÷ N applied | g/kg | Grain yield |
-| RE-N  | (NUt − NUT1) ÷ N applied × 100 | % | Yield + grain N% + straw N% |
+| PFP-N | Grain yield ÷ N applied | g grain / g N (= kg/kg) | Grain yield + N rate + pot area |
+| AE-N  | (Yt − YT1) ÷ N applied | g grain / g N | Grain yield + N rate + pot area |
+| RE-N  | (NUt − NUT1) ÷ N applied × 100 | % | Yield + grain N% + straw N% + pot area |
 | PE-N  | (Yt − YT1) ÷ (NUt − NUT1) | g/g | Same as RE |
 | NHI   | Grain N uptake ÷ Total N uptake × 100 | % | Same as RE |
 | Protein | Grain N% × 5.7 | % | Grain N% |
 
-*NU = total plant N uptake (g/pot) = grain DW × grain N% + straw DW × straw N%*
+*N applied (g/pot) = rate (kg/ha) × pot area (m²) ÷ 10000 × 1000.*
+*NU = total plant N uptake (g/pot) = grain DW × grain N% + straw DW × straw N%, on an oven-dry basis.*
+*PE-N is shown only when a treatment's N uptake exceeds the control (NUt − NUT1 > 0); otherwise the ratio is not interpretable and is left blank.*
         """)
 
     nue_df = nue_dataframe()
@@ -2757,13 +3056,18 @@ with tab_outlier:
     sync_df_from_editors()
     st.markdown("""
 **Methods used:**
-- **Dixon's Q test** — recommended for n=3–10. Tests whether the lowest or highest
-  value in a group is a statistical outlier. Q_critical (α=0.05, n=3) = 0.970.
+- **Dixon's Q test** (r10 ratio) — recommended for n=3–10. Tests whether the lowest or
+  highest value in a group is a statistical outlier. Critical values: two-sided 95%
+  table of Rorabacher (1991); Q_critical (n=3) = 0.970.
 - **Grubbs' test** — tests whether the single most extreme value is an outlier.
   More powerful when n>6; included here as a secondary check.
 
-⚠️ With n=3 replicates, outlier tests have very low statistical power. A flagged value
-should be reviewed against your field diary before removal — do not exclude automatically.
+A value is flagged if **either** test triggers. Reporting two tests with an OR rule
+raises the per-group false-positive rate, so flags are a prompt to **review**, not a
+rule to exclude. With n=3 replicates both tests have very low power regardless.
+
+⚠️ A flagged value should be checked against your field diary before removal —
+do not exclude automatically.
     """)
 
     with st.expander("Dixon Q critical values (α=0.05)", expanded=False):
@@ -3090,8 +3394,8 @@ with tab_report:
             for _, row in nue.iterrows():
                 lines.append(
                     f"  {row['Treatment']:<5}"
-                    f" {str(row['PFP-N (g/kg)']):>8}"
-                    f" {str(row['AE-N (g/kg)']):>8}"
+                    f" {str(row['PFP-N (g/g)']):>8}"
+                    f" {str(row['AE-N (g/g)']):>8}"
                     f" {str(row['RE-N (%)']):>8}"
                     f" {str(row['PE-N (g/g)']):>8}"
                     f" {str(row['NHI (%)']):>8}"
