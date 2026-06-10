@@ -95,6 +95,14 @@ pip install -r requirements.txt
 ```bash
 streamlit run wheat_dashboard.py
 ```
+### Run the validation suite
+
+```bash
+python validate_spade.py
+```
+
+This cross-checks all statistical routines against independent references.
+Exit code 0 = all checks passed.
 
 **4. Open in browser**
 
@@ -138,6 +146,17 @@ SPADE saves data to `wheat_data.xlsx` with the following sheets:
 If you have existing data in a flat Excel file (one sheet, columns matching the parameter names), SPADE will load it automatically on first run and convert to the multi-sheet format on the next save.
 
 ---
+## Repository Structure
+
+| File | Description |
+|------|-------------|
+| `wheat_dashboard.py` | Main Streamlit application — run this |
+| `spade_stats.py` | Pure statistical core (no Streamlit dependency) — importable and testable independently |
+| `validate_spade.py` | Automated validation harness — 17 checks against independent references |
+| `requirements.txt` | Python dependencies |
+| `USER_GUIDE.md` | Detailed usage guide with tab-by-tab walkthrough |
+| `CONTRIBUTING.md` | Contribution guidelines |
+| `sample_data/` | Sample dataset for demonstration |
 
 ## Tabs Overview
 
