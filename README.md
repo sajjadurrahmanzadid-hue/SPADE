@@ -80,7 +80,7 @@ SPADE was developed at the **Dhaka University Nanotechnology Centre (DUNTC)**, U
 
 **1. Clone the repository**
 ```bash
-git clone https://github.com/YOUR_USERNAME/spade.git
+git clone https://github.com/sajjadurrahmanzadid-hue/SPADE.git
 cd spade
 ```
 
@@ -191,7 +191,7 @@ If you use SPADE in your research, please cite:
 ```
 Rahman, S. (2025). SPADE: Statistical Platform for Agronomic Data Evaluation.
 Dhaka University Nanotechnology Centre (DUNTC), University of Dhaka.
-GitHub: https://github.com/YOUR_USERNAME/spade
+GitHub: https://github.com/sajjadurrahmanzadid-hue/SPADE.git
 ```
 
 A methods paper describing SPADE's analytical framework is in preparation, targeting *Computers and Electronics in Agriculture*.
