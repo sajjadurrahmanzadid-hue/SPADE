@@ -90,6 +90,12 @@ cd spade
 ```bash
 pip install -r requirements.txt
 ```
+**Or with conda (recommended for exact reproducibility):**
+```bash
+conda env create -f environment.yml
+conda activate spade
+streamlit run wheat_dashboard.py
+```
 
 > **Note on kaleido (for PNG/JPG export):** On some systems `pip install kaleido` may fail. If so, try `pip install kaleido==0.2.1`. PNG/JPG export is optional — all other features work without it.
 
