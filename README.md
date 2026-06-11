@@ -7,10 +7,12 @@
 ---
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)](https://python.org)
+[![Validate SPADE](https://github.com/sajjadurrahmanzadid-hue/SPADE/actions/workflows/python-app.yml/badge.svg)](https://github.com/sajjadurrahmanzadid-hue/SPADE/actions/workflows/python-app.yml)
 [![Streamlit](https://img.shields.io/badge/Built%20with-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
 [![Offline](https://img.shields.io/badge/Runs-Offline-success)]()
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20634853.svg)](https://doi.org/10.5281/zenodo.20634853)
 
 ---
 
@@ -91,6 +93,12 @@ pip install -r requirements.txt
 
 > **Note on kaleido (for PNG/JPG export):** On some systems `pip install kaleido` may fail. If so, try `pip install kaleido==0.2.1`. PNG/JPG export is optional — all other features work without it.
 
+**Or install with conda (recommended for exact reproducibility):**
+```bash
+conda env create -f environment.yml
+conda activate spade
+```
+
 **3. Run SPADE**
 ```bash
 streamlit run wheat_dashboard.py
@@ -156,6 +164,7 @@ If you have existing data in a flat Excel file (one sheet, columns matching the 
 | `requirements.txt` | Python dependencies |
 | `USER_GUIDE.md` | Detailed usage guide with tab-by-tab walkthrough |
 | `CONTRIBUTING.md` | Contribution guidelines |
+| `environment.yml` | Conda environment file — pins exact dependency versions for reproducibility |
 | `sample_data/` | Sample dataset for demonstration |
 
 ## Tabs Overview
@@ -208,10 +217,13 @@ SPADE was developed using a pot experiment evaluating nano-urea versus conventio
 If you use SPADE in your research, please cite:
 
 ```
-Rahman, S. (2025). SPADE: Statistical Platform for Agronomic Data Evaluation.
+Rahman, S. (2025). SPADE: Statistical Platform for Agronomic Data Evaluation (v1.0.0).
 Dhaka University Nanotechnology Centre (DUNTC), University of Dhaka.
-GitHub: https://github.com/sajjadurrahmanzadid-hue/SPADE.git
+Zenodo. https://doi.org/10.5281/zenodo.20634853
 ```
+
+> **Permanent DOI:** [https://doi.org/10.5281/zenodo.20634853](https://doi.org/10.5281/zenodo.20634853)  
+> This DOI always resolves to the archived code, independent of GitHub.
 
 A methods paper describing SPADE's analytical framework is in preparation, targeting *Computers and Electronics in Agriculture*.
 
